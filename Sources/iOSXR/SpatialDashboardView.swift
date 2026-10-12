@@ -1,4 +1,5 @@
 import ARKit
+import ImageIO
 import RealityKit
 import SwiftUI
 import UIKit
@@ -8,54 +9,63 @@ struct SpatialDashboardView: View {
     let isActive: Bool
     let onNavigate: (AppTab) -> Void
     @StateObject private var compass = CompassHeadingService()
+    @State private var handPose = SpatialHandModel.empty
+    @State private var handPinch: CGPoint?
 
     var body: some View {
-        ZStack(alignment: .top) {
-            SpatialARView(isActive: isActive) { name in
-                switch name {
-                case "store":
-                    onNavigate(.store)
-                case "library":
-                    onNavigate(.library)
-                case "browser":
-                    onNavigate(.browser)
-                default:
-                    break
-                }
+        ZStack {
+            if isActive {
+                SpatialARView(
+                    isActive: true,
+                    onPinch: { point in
+                        handPinch = point
+                    },
+                    onHandPose: {
+                        handPose = $0
+                        if !$0.isPinching {
+                            handPinch = nil
+                        }
+                    }
+                )
+                .ignoresSafeArea()
+                .blur(radius: 2.5)
+                .overlay(Color.white.opacity(0.16))
+            } else {
+                Color.black.ignoresSafeArea()
             }
-            .ignoresSafeArea()
 
-            VStack(spacing: 8) {
-                Text("iOSXR")
-                    .font(.largeTitle.bold())
-                Text(compass.headingDegrees.map {
+            SpatialLauncherView(
+                heading: compass.headingDegrees.map {
                     String(format: "%@ · %.0f°", compass.status, $0)
-                } ?? compass.status)
-                    .font(.callout)
-            }
-            .padding(16)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
-            .padding(.top, 20)
-            .allowsHitTesting(false)
+                } ?? compass.status,
+                hand: handPose,
+                handPinch: handPinch,
+                onOpen: { destination in
+                    switch destination {
+                    case "store":
+                        onNavigate(.store)
+                    case "library":
+                        onNavigate(.library)
+                    case "browser":
+                        onNavigate(.browser)
+                    default:
+                        break
+                    }
+                }
+            )
 
             if !ARWorldTrackingConfiguration.isSupported {
-                ContentUnavailableView(
-                    "AR Tracking Is Not Supported",
-                    systemImage: "viewfinder",
-                    description: Text("This device does not support ARKit world tracking.")
-                )
-                .padding(.top, 110)
+                VStack {
+                    Spacer()
+                    Label("AR unavailable · touch controls still work", systemImage: "viewfinder")
+                        .font(.system(size: 11, weight: .medium))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(.regularMaterial, in: Capsule())
+                        .padding(.bottom, 8)
+                }
+                .allowsHitTesting(false)
             }
-
-            HStack(spacing: 20) {
-                navigationButton("Store", symbol: "bag", tab: .store)
-                navigationButton("Library", symbol: "square.stack.3d.up", tab: .library)
-                navigationButton("Browser", symbol: "safari", tab: .browser)
-            }
-            .padding(12)
-            .background(.regularMaterial, in: Capsule())
-            .frame(maxHeight: .infinity, alignment: .bottom)
-            .padding(.bottom, 76)
         }
         .onAppear {
             if isActive {
@@ -64,6 +74,8 @@ struct SpatialDashboardView: View {
         }
         .onChange(of: isActive) { active in
             if active {
+                handPose = .empty
+                handPinch = nil
                 compass.start()
             } else {
                 compass.stop()
@@ -71,30 +83,20 @@ struct SpatialDashboardView: View {
         }
         .onDisappear(perform: compass.stop)
     }
-
-    private func navigationButton(_ title: String, symbol: String, tab: AppTab) -> some View {
-        Button {
-            onNavigate(tab)
-        } label: {
-            Label(title, systemImage: symbol)
-        }
-        .buttonStyle(.plain)
-    }
 }
 
 private struct SpatialARView: UIViewRepresentable {
     let isActive: Bool
-    let onSelect: (String) -> Void
+    let onPinch: (CGPoint) -> Void
+    let onHandPose: (SpatialHandModel) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onSelect: onSelect)
+        Coordinator(onPinch: onPinch, onHandPose: onHandPose)
     }
 
     func makeUIView(context: Context) -> ARView {
         let view = ARView(frame: .zero)
         context.coordinator.arView = view
-        context.coordinator.installDashboard(in: view)
-
         guard ARWorldTrackingConfiguration.isSupported else {
             return view
         }
@@ -108,7 +110,8 @@ private struct SpatialARView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: ARView, context: Context) {
-        context.coordinator.onSelect = onSelect
+        context.coordinator.onPinch = onPinch
+        context.coordinator.onHandPose = onHandPose
         context.coordinator.setActive(isActive)
     }
 
@@ -118,15 +121,21 @@ private struct SpatialARView: UIViewRepresentable {
 
     final class Coordinator: NSObject, ARSessionDelegate {
         weak var arView: ARView?
-        var onSelect: (String) -> Void
+        var onPinch: (CGPoint) -> Void
+        var onHandPose: (SpatialHandModel) -> Void
         var configuration: ARWorldTrackingConfiguration?
         private var isActive = false
         private let visionQueue = DispatchQueue(label: "com.iosxr.hand-pose")
         private let frameGate = DispatchSemaphore(value: 1)
         private var pinchWasActive = false
+        private var lastDetectionTime = CACurrentMediaTime()
 
-        init(onSelect: @escaping (String) -> Void) {
-            self.onSelect = onSelect
+        init(
+            onPinch: @escaping (CGPoint) -> Void,
+            onHandPose: @escaping (SpatialHandModel) -> Void
+        ) {
+            self.onPinch = onPinch
+            self.onHandPose = onHandPose
         }
 
         func setActive(_ active: Bool) {
@@ -141,30 +150,10 @@ private struct SpatialARView: UIViewRepresentable {
             }
         }
 
-        func installDashboard(in view: ARView) {
-            let anchor = AnchorEntity(.camera)
-            let panelDefinitions: [(String, SIMD3<Float>, UIColor)] = [
-                ("store", SIMD3(-0.31, 0, 0), .systemTeal),
-                ("library", SIMD3(0, 0, 0), .systemIndigo),
-                ("browser", SIMD3(0.31, 0, 0), .systemOrange)
-            ]
-
-            for (name, position, color) in panelDefinitions {
-                let panel = ModelEntity(
-                    mesh: .generateBox(size: SIMD3(0.27, 0.2, 0.025)),
-                    materials: [SimpleMaterial(color: color, isMetallic: false)]
-                )
-                panel.name = name
-                panel.position = SIMD3(position.x, position.y, -0.75)
-                panel.generateCollisionShapes(recursive: false)
-                anchor.addChild(panel)
-            }
-
-            view.scene.addAnchor(anchor)
-        }
-
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
+            guard CACurrentMediaTime() - lastDetectionTime >= 1.0 / 12.0 else { return }
             guard frameGate.wait(timeout: .now()) == .success else { return }
+            lastDetectionTime = CACurrentMediaTime()
             visionQueue.async { [weak self, frameGate] in
                 defer { frameGate.signal() }
                 guard let self else { return }
@@ -178,6 +167,9 @@ private struct SpatialARView: UIViewRepresentable {
                     ).perform([request])
                 } catch {
                     self.pinchWasActive = false
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onHandPose(.empty)
+                    }
                     return
                 }
 
@@ -189,6 +181,9 @@ private struct SpatialARView: UIViewRepresentable {
                     index.confidence > 0.5
                 else {
                     self.pinchWasActive = false
+                    DispatchQueue.main.async { [weak self] in
+                        self?.onHandPose(.empty)
+                    }
                     return
                 }
 
@@ -197,8 +192,29 @@ private struct SpatialARView: UIViewRepresentable {
                 let isPinching = hypot(dx, dy) < 0.045
                 let didBeginPinch = isPinching && !self.pinchWasActive
                 self.pinchWasActive = isPinching
+                let recognizedJoints = try? hand.recognizedPoints(.all)
+                let bones = Self.bonePairs.compactMap { pair -> (CGPoint, CGPoint)? in
+                    let (first, second) = pair
+                    guard
+                        let a = recognizedJoints?[first],
+                        let b = recognizedJoints?[second],
+                        a.confidence > 0.25,
+                        b.confidence > 0.25
+                    else {
+                        return nil
+                    }
+                    return (a.location, b.location)
+                }
+                let visibleJoints = Self.jointNames.compactMap { joint -> CGPoint? in
+                    guard
+                        let point = recognizedJoints?[joint],
+                        point.confidence > 0.25
+                    else {
+                        return nil
+                    }
+                    return point.location
+                }
 
-                guard didBeginPinch else { return }
                 DispatchQueue.main.async { [weak self] in
                     guard
                         let self,
@@ -209,30 +225,48 @@ private struct SpatialARView: UIViewRepresentable {
                         return
                     }
 
-                    let imagePoint = CGPoint(
-                        x: index.location.x,
-                        y: 1 - index.location.y
-                    )
                     let orientation = view.window?.windowScene?.interfaceOrientation ?? .portrait
-                    let screenPoint = imagePoint
-                        .applying(frame.displayTransform(
-                            for: orientation,
-                            viewportSize: view.bounds.size
-                        ))
-                        .applying(CGAffineTransform(
-                            scaleX: view.bounds.width,
-                            y: view.bounds.height
-                        ))
-                    guard let hit = view.hitTest(
-                        screenPoint,
-                        query: .nearest,
-                        mask: .all
-                    ).first else {
-                        return
+                    let transform = frame.displayTransform(
+                        for: orientation,
+                        viewportSize: view.bounds.size
+                    )
+                    func displayPoint(_ point: CGPoint) -> CGPoint {
+                        CGPoint(x: point.x, y: 1 - point.y)
+                            .applying(transform)
                     }
-                    self.onSelect(hit.entity.name)
+                    let cursor = displayPoint(index.location)
+                    let displayedBones = bones.map {
+                        (displayPoint($0.0), displayPoint($0.1))
+                    }
+                    let displayedJoints = visibleJoints.map(displayPoint)
+                    self.onHandPose(SpatialHandModel(
+                        joints: displayedJoints,
+                        bones: displayedBones,
+                        pinchPoint: cursor,
+                        isPinching: isPinching
+                    ))
+                    guard didBeginPinch else { return }
+                    self.onPinch(cursor)
                 }
             }
         }
+
+        private static let jointNames: [VNHumanHandPoseObservation.JointName] = [
+            .wrist,
+            .thumbCMC, .thumbMP, .thumbIP, .thumbTip,
+            .indexMCP, .indexPIP, .indexDIP, .indexTip,
+            .middleMCP, .middlePIP, .middleDIP, .middleTip,
+            .ringMCP, .ringPIP, .ringDIP, .ringTip,
+            .littleMCP, .littlePIP, .littleDIP, .littleTip
+        ]
+
+        private static let bonePairs: [(VNHumanHandPoseObservation.JointName, VNHumanHandPoseObservation.JointName)] = [
+            (.wrist, .thumbCMC), (.thumbCMC, .thumbMP), (.thumbMP, .thumbIP), (.thumbIP, .thumbTip),
+            (.wrist, .indexMCP), (.indexMCP, .indexPIP), (.indexPIP, .indexDIP), (.indexDIP, .indexTip),
+            (.wrist, .middleMCP), (.middleMCP, .middlePIP), (.middlePIP, .middleDIP), (.middleDIP, .middleTip),
+            (.wrist, .ringMCP), (.ringMCP, .ringPIP), (.ringPIP, .ringDIP), (.ringDIP, .ringTip),
+            (.wrist, .littleMCP), (.littleMCP, .littlePIP), (.littlePIP, .littleDIP), (.littleDIP, .littleTip),
+            (.indexMCP, .middleMCP), (.middleMCP, .ringMCP), (.ringMCP, .littleMCP)
+        ]
     }
 }
